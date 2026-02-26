@@ -1,0 +1,10 @@
+--extra-index-url https://download.pytorch.org/whl/cu126
+torch==2.6.0
+transformers==4.51.3
+accelerate==1.6.0
+snac
+soundfile>=0.12
+numpy>=1.26
+scipy>=1.11
+hf-transfer>=0.1.6
+sentencepiece>=0.2.0
