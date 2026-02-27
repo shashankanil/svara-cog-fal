@@ -280,7 +280,7 @@ class Predictor(BasePredictor):
         self,
         prompt_text: str,
         voice_id: str,
-        stream: bool,
+        # stream: bool,  # kept for quick re-enable later
         max_tokens: int,
         temperature: float,
         top_p: float,
@@ -301,19 +301,15 @@ class Predictor(BasePredictor):
             seed=seed if seed >= 0 else None,
         )
 
-        if stream:
-            print(f"[request] req_id={request_id} mode=stream")
-            return await self._generate_pcm16(request_id, prompt_string, sampling_params, stream_mode=True)
-
-        print(f"[request] req_id={request_id} mode=non_stream")
-        return await self._generate_pcm16(request_id, prompt_string, sampling_params, stream_mode=False)
+        print(f"[request] req_id={request_id} mode=stream(hardcoded)")
+        return await self._generate_pcm16(request_id, prompt_string, sampling_params, stream_mode=True)
 
     def predict(
         self,
         transcript: str = Input(description="Text to synthesize", default="Hello, this is a test."),
         text: str = Input(description="Optional alias for transcript", default=""),
         voice_id: str = Input(description="Supported speaker ID", default="prakash", choices=VOICE_ID_CHOICES),
-        stream: bool = Input(description="Use stream-style generation path internally", default=False),
+        # stream: bool = Input(description="Use stream-style generation path internally", default=False),
         max_tokens: int = Input(description="Maximum generated tokens", default=4500, ge=128, le=8192),
         temperature: float = Input(description="Sampling temperature", default=0.7, ge=0.0, le=2.0),
         top_p: float = Input(description="Top-p nucleus sampling", default=0.95, ge=0.1, le=1.0),
@@ -332,7 +328,6 @@ class Predictor(BasePredictor):
                 self._predict_async(
                     prompt_text=prompt_text,
                     voice_id=voice_id,
-                    stream=stream,
                     max_tokens=max_tokens,
                     temperature=temperature,
                     top_p=top_p,
