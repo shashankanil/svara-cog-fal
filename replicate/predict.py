@@ -293,3 +293,121 @@ class Predictor(BasePredictor):
     async def _generate_non_stream_event(self, request_id: str, prompt_string: str, sampling_params: SamplingParams):
         stream = self.llm.generate(
             prompt=prompt_string,
+            sampling_params=sampling_params,
+            request_id=request_id,
+        )
+
+        req_start = time.time()
+        buffer = []
+        count = 0
+        first_audio_token_at = None
+
+        async for out in stream:
+            token = self._turn_token_into_id(out.outputs[0].text, count)
+            if token is None:
+                continue
+            if token > 0:
+                buffer.append(token)
+                count += 1
+                if first_audio_token_at is None and count > 27:
+                    first_audio_token_at = time.time()
+
+        if first_audio_token_at is None:
+            print(f"[ttft] req_id={request_id} mode=non_stream ttft_ms=NA")
+        else:
+            print(
+                f"[ttft] req_id={request_id} mode=non_stream "
+                f"ttft_ms={(first_audio_token_at - req_start) * 1000.0:.2f}"
+            )
+
+        print(f"[timing] req_id={request_id} mode=non_stream total_ms={(time.time() - req_start) * 1000.0:.2f}")
+
+        if not buffer:
+            return json.dumps({"event": "error", "message": "No audio tokens decoded from model output."}) + "\n"
+
+        pcm16_bytes = self._decode_full_buffer_to_pcm16(buffer)
+        wav_bytes = self._pcm16_to_wav_bytes(pcm16_bytes)
+
+        payload = {
+            "event": "result",
+            "format": "wav",
+            "sampling_rate": SAMPLE_RATE,
+            "num_audio_tokens": len(buffer),
+            "wav_b64": base64.b64encode(wav_bytes).decode("ascii"),
+        }
+        return json.dumps(payload) + "\n"
+
+    async def _predict_async(
+        self,
+        prompt_text: str,
+        voice_id: str,
+        stream: bool,
+        max_tokens: int,
+        temperature: float,
+        top_p: float,
+        repetition_penalty: float,
+        stop_token_id: int,
+        seed: int,
+    ):
+        request_id = f"req-{uuid4().hex}"
+        voice_name = VOICE_NAME_BY_ID.get(voice_id, "Prakash")
+        prompt_string = self._format_prompt_string(voice_name=voice_name, text=prompt_text)
+
+        sampling_params = SamplingParams(
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            repetition_penalty=repetition_penalty,
+            stop_token_ids=[stop_token_id],
+            seed=seed if seed >= 0 else None,
+        )
+
+        if stream:
+            print(f"[request] req_id={request_id} mode=stream")
+            async for event in self._generate_stream_events(request_id, prompt_string, sampling_params):
+                yield event
+        else:
+            print(f"[request] req_id={request_id} mode=non_stream")
+            yield await self._generate_non_stream_event(request_id, prompt_string, sampling_params)
+
+    def predict(
+        self,
+        text: str = Input(description="Text to synthesize", default=""),
+        transcript: str = Input(description="Text to synthesize (alias for text)", default="Hello, this is a test."),
+        voice_id: str = Input(description="Supported speaker ID", default="prakash", choices=VOICE_ID_CHOICES),
+        stream: bool = Input(description="Stream partial PCM chunks as NDJSON", default=True),
+        max_tokens: int = Input(description="Maximum generated tokens", default=4500, ge=128, le=8192),
+        temperature: float = Input(description="Sampling temperature", default=0.7, ge=0.0, le=2.0),
+        top_p: float = Input(description="Top-p nucleus sampling", default=0.95, ge=0.1, le=1.0),
+        repetition_penalty: float = Input(description="Repetition penalty", default=1.2, ge=0.8, le=2.0),
+        stop_token_id: int = Input(description="Stop token ID", default=49158),
+        seed: int = Input(description="Random seed (-1 for random)", default=-1),
+    ) -> ConcatenateIterator[str]:
+        prompt_text = text.strip() if text.strip() else transcript.strip()
+        if not prompt_text:
+            raise ValueError("Text not provided.")
+
+        async_gen = self._predict_async(
+            prompt_text=prompt_text,
+            voice_id=voice_id,
+            stream=stream,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            repetition_penalty=repetition_penalty,
+            stop_token_id=stop_token_id,
+            seed=seed,
+        )
+
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            while True:
+                try:
+                    yield loop.run_until_complete(async_gen.__anext__())
+                except StopAsyncIteration:
+                    break
+        finally:
+            loop.run_until_complete(async_gen.aclose())
+            loop.close()
+            asyncio.set_event_loop(None)
