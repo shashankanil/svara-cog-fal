@@ -1,327 +1,295 @@
-"""
-Svara-TTS Replicate Predictor
-
-Deploys kenpath/svara-tts-v1 (3B Llama-based TTS) as a Replicate model.
-Generates 24kHz mono WAV audio from text across 19+ Indian languages
-using the Svara-TTS token protocol and SNAC 3-layer audio codec.
-
-Reference: https://huggingface.co/spaces/kenpath/svara-tts (known-working Gradio demo)
-"""
-
+import asyncio
+import base64
+import io
+import json
 import os
 import time
-import tempfile
+import wave
+from typing import AsyncGenerator
+from uuid import uuid4
 
 import numpy as np
 import torch
-import soundfile as sf
-from cog import BasePredictor, Input, Path
+from cog import BasePredictor, ConcatenateIterator, Input
+from snac import SNAC
+from transformers import AutoTokenizer
+from vllm import SamplingParams
+from vllm.engine.arg_utils import AsyncEngineArgs
+from vllm.engine.async_llm_engine import AsyncLLMEngine
 
 os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-SR = 24_000  # SNAC sample rate
+MODEL_ID = os.getenv("VLLM_MODEL", "kenpath/voice-svara-tts-v1-fft-v0.5")
+SNAC_MODEL_ID = os.getenv("SNAC_MODEL", "hubertsiuzdak/snac_24khz")
 
-# Language map: code -> label used in the prompt
-LANG_MAP = {
-    "hi": "Hindi",
-    "en": "English",
-    "bn": "Bengali",
-    "ta": "Tamil",
-    "te": "Telugu",
-    "mr": "Marathi",
-    "gu": "Gujarati",
-    "kn": "Kannada",
-    "ml": "Malayalam",
-    "pa": "Punjabi",
-    "or": "Odia",
-    "as": "Assamese",
-    "ur": "Urdu",
-    "sd": "Sindhi",
-    "ne": "Nepali",
-    "si": "Sinhala",
-    "sa": "Sanskrit",
-    "ks": "Kashmiri",
-    "doi": "Dogri",
-}
-
-# Emotion/style tags supported by the model
-VALID_STYLES = {"neutral", "formal", "chat", "clear", "happy", "surprise", "sad", "fear", "anger", "disgust"}
-
-
-# ---------------------------------------------------------------------------
-# Token protocol helpers (matches Gradio demo exactly)
-# ---------------------------------------------------------------------------
-def parse_output(generated_ids: torch.Tensor) -> list[int]:
-    """Extract SNAC codes from generated token IDs.
-
-    1. Find the LAST occurrence of START_OF_SPEECH (128257)
-    2. Crop everything after it
-    3. Remove END_OF_SPEECH (128258) tokens
-    4. Trim to multiple of 7
-    5. Subtract 128266 from each token to get raw SNAC codes
-    """
-    token_to_find = 128257    # START_OF_SPEECH
-    token_to_remove = 128258  # END_OF_SPEECH
-
-    token_indices = (generated_ids == token_to_find).nonzero(as_tuple=True)
-    if len(token_indices[1]) > 0:
-        cropped_tensor = generated_ids[:, token_indices[1][-1] + 1:]
-    else:
-        cropped_tensor = generated_ids
-
-    # Remove END_OF_SPEECH tokens
-    row = cropped_tensor[0]
-    row = row[row != token_to_remove]
-
-    # Trim to multiple of 7 (7 codes per frame)
-    trimmed_row = row[: (row.size(0) // 7) * 7]
-
-    # Convert to raw SNAC codes
-    code_list = [int(t.item()) - 128266 for t in trimmed_row]
-    return code_list
+SAMPLE_RATE = 24000
+SUBCODEBOOK_SIZE = 4096
+TOTAL_CODEBOOKS = 7
+SUPPORTED_VOICES = [
+    ("aaradhya", "Aaradhya"),
+    ("abhiram", "Abhiram"),
+    ("aditya", "Aditya"),
+    ("akshat", "Akshat"),
+    ("akshay", "Akshay"),
+    ("ananya", "Ananya"),
+    ("anika", "Anika"),
+    ("anirudh", "Anirudh"),
+    ("anjali", "Anjali"),
+    ("ayesha", "Ayesha"),
+    ("bunty", "Bunty"),
+    ("chanchal", "Chanchal"),
+    ("danish", "Danish"),
+    ("digpal", "Digpal"),
+    ("hansika", "Hansika"),
+    ("kanika", "Kanika"),
+    ("karan", "Karan"),
+    ("karthik", "Karthik"),
+    ("kishan", "Kishan"),
+    ("likhitha", "Likhitha"),
+    ("madhu", "Madhu"),
+    ("maheshwari", "Maheshwari"),
+    ("manav", "Manav"),
+    ("monica", "Monica"),
+    ("mumtaz", "Mumtaz"),
+    ("prakash", "Prakash"),
+    ("priya", "Priya"),
+    ("rahul", "Rahul"),
+    ("rajesh", "Rajesh"),
+    ("ranbir", "Ranbir"),
+    ("riya", "Riya"),
+    ("sagar", "Sagar"),
+    ("samisha", "Samisha"),
+    ("sapna", "Sapna"),
+    ("shalini", "Shalini"),
+    ("shashank", "Shashank"),
+    ("shivam", "Shivam"),
+    ("shivani", "Shivani"),
+    ("siddharth", "Siddharth"),
+    ("simran", "Simran"),
+    ("smrithi", "Smrithi"),
+    ("sneha", "Sneha"),
+    ("tanvi", "Tanvi"),
+    ("tanya", "Tanya"),
+    ("tripti", "Tripti"),
+    ("vasanth", "Vasanth"),
+    ("vidya", "Vidya"),
+    ("viraj", "Viraj"),
+    ("vishal", "Vishal"),
+    ("yash", "Yash"),
+]
+VOICE_NAME_BY_ID = {voice_id: name for voice_id, name in SUPPORTED_VOICES}
+VOICE_ID_CHOICES = [voice_id for voice_id, _ in SUPPORTED_VOICES]
 
 
-def redistribute_codes(code_list: list[int], snac_model, device: str) -> np.ndarray:
-    """Decode SNAC codes to audio waveform.
-
-    Each frame is 7 codes mapped to 3 SNAC layers:
-      codes[0]           -> layer 1 (coarsest, 1 code/frame)
-      codes[1], codes[4] -> layer 2 (mid, 2 codes/frame)
-      codes[2], codes[3], codes[5], codes[6] -> layer 3 (finest, 4 codes/frame)
-
-    Band offsets are subtracted to bring each code back to [0, 4096):
-      layer 1: codes[0] (no offset)
-      layer 2: codes[1] - 4096, codes[4] - 4*4096
-      layer 3: codes[2] - 2*4096, codes[3] - 3*4096, codes[5] - 5*4096, codes[6] - 6*4096
-    """
-    layer_1, layer_2, layer_3 = [], [], []
-
-    num_frames = (len(code_list) + 1) // 7
-    for i in range(num_frames):
-        base = 7 * i
-        layer_1.append(code_list[base + 0])
-        layer_2.append(code_list[base + 1] - 4096)
-        layer_3.append(code_list[base + 2] - (2 * 4096))
-        layer_3.append(code_list[base + 3] - (3 * 4096))
-        layer_2.append(code_list[base + 4] - (4 * 4096))
-        layer_3.append(code_list[base + 5] - (5 * 4096))
-        layer_3.append(code_list[base + 6] - (6 * 4096))
-
-    codes = [
-        torch.tensor(layer_1, device=device).unsqueeze(0),
-        torch.tensor(layer_2, device=device).unsqueeze(0),
-        torch.tensor(layer_3, device=device).unsqueeze(0),
-    ]
-
-    with torch.inference_mode():
-        audio = snac_model.decode(codes).detach().squeeze().cpu().numpy()
-
-    return audio
-
-
-# ---------------------------------------------------------------------------
-# Predictor
-# ---------------------------------------------------------------------------
 class Predictor(BasePredictor):
     def setup(self) -> None:
-        """Load the LLM and SNAC decoder into GPU memory."""
-        from transformers import AutoTokenizer, AutoModelForCausalLM
-        from snac import SNAC
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
 
-        self.device = "cuda"
-        model_id = "kenpath/svara-tts-v1"
+        # Keep token fallback behavior aligned with the original Modal script.
+        self.start_token = self._token_id_or_default("<custom_token_7>", 128259)
+        self.end_tokens = [
+            self._token_id_or_default("<|eot_id|>", 128009),
+            self._token_id_or_default("<custom_token_8>", 128260),
+            self._token_id_or_default("<custom_token_9>", 128261),
+            self._token_id_or_default("<custom_token_5>", 128257),
+        ]
 
-        print("Loading tokenizer...")
-        self.tokenizer = AutoTokenizer.from_pretrained(model_id)
+        engine_args = AsyncEngineArgs(
+            model=MODEL_ID,
+            trust_remote_code=False,
+            tensor_parallel_size=int(os.getenv("VLLM_TENSOR_PARALLEL_SIZE", "1")),
+            max_model_len=int(os.getenv("VLLM_MAX_MODEL_LEN", "8192")),
+            gpu_memory_utilization=float(os.getenv("VLLM_GPU_MEMORY_UTILIZATION", "0.9")),
+            dtype=os.getenv("VLLM_DTYPE", "auto"),
+            quantization=os.getenv("VLLM_QUANTIZATION") or None,
+            enforce_eager=os.getenv("VLLM_ENFORCE_EAGER", "true").lower() == "true",
+        )
+        self.llm = AsyncLLMEngine.from_engine_args(engine_args)
 
-        print("Loading LLM (3B params)...")
-        self.model = AutoModelForCausalLM.from_pretrained(
-            model_id,
-            torch_dtype=torch.bfloat16,
-        ).to(self.device)
-        self.model.eval()
-        print(f"Model loaded, vocab size: {self.model.config.vocab_size}")
+        self.snac_model = SNAC.from_pretrained(SNAC_MODEL_ID).to(self.device)
+        self.snac_model.eval()
 
-        print("Loading SNAC decoder...")
-        self.snac = SNAC.from_pretrained("hubertsiuzdak/snac_24khz").eval().to(self.device)
+    def _token_id_or_default(self, token_text: str, default: int) -> int:
+        tok_id = self.tokenizer.convert_tokens_to_ids(token_text)
+        if isinstance(tok_id, int) and tok_id >= 0:
+            return tok_id
+        return default
 
-        print("Running warmup inference...")
-        self._synthesize("hello", "en_female", None)
-        print("Setup complete.")
+    def _format_prompt_string(self, voice_name: str, text: str) -> str:
+        formatted = f"<|audio|> {voice_name}: {text}<|eot_id|>"
+        wrapped = "<custom_token_3>" + formatted + "<custom_token_4><custom_token_5>"
+        prompt_tokens = self.tokenizer(wrapped, return_tensors="pt")
+        start_token = torch.tensor([[self.start_token]], dtype=torch.int64)
+        end_tokens = torch.tensor([self.end_tokens], dtype=torch.int64)
+        all_input_ids = torch.cat([start_token, prompt_tokens.input_ids, end_tokens], dim=1)
+        return self.tokenizer.decode(all_input_ids[0])
 
-    # -----------------------------------------------------------------------
-    # Prompt building (matches Gradio demo process_prompt exactly)
-    # -----------------------------------------------------------------------
-    def _build_prompt(
-        self, text: str, voice: str, emotion: str | None = None
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Build prompt token IDs and attention mask.
+    def _turn_token_into_id(self, token_string: str, index: int):
+        token_string = token_string.strip()
+        last_token_start = token_string.rfind("<custom_token_")
+        if last_token_start == -1:
+            return None
+        last_token = token_string[last_token_start:]
+        if not (last_token.startswith("<custom_token_") and last_token.endswith(">")):
+            return None
+        try:
+            number_str = last_token[14:-1]
+            return int(number_str) - 10 - ((index % TOTAL_CODEBOOKS) * SUBCODEBOOK_SIZE)
+        except ValueError:
+            return None
 
-        Format: [128259] + tokenizer(prompt).input_ids + [128009, 128260]
-          128259 = START_OF_HUMAN
-          128009 = END_OF_TURN
-          128260 = END_OF_HUMAN
-        """
-        # Parse voice into language label + gender
-        parts = voice.split("_")
-        lang_code = parts[0]
-        gender = parts[1].capitalize() if len(parts) > 1 else "Female"
-        lang_label = LANG_MAP.get(lang_code, "Hindi")
+    def _decode_recent_multiframe_to_pcm16(self, multiframe):
+        if len(multiframe) < TOTAL_CODEBOOKS:
+            return b""
 
-        # Build the text prompt with optional emotion tag
-        tail = ""
-        if emotion and emotion in VALID_STYLES and emotion != "neutral":
-            tail = f" <{emotion}>"
+        codes_0 = torch.tensor([], device=self.device, dtype=torch.int32)
+        codes_1 = torch.tensor([], device=self.device, dtype=torch.int32)
+        codes_2 = torch.tensor([], device=self.device, dtype=torch.int32)
 
-        prompt = f"{lang_label} ({gender}): {text}{tail}"
-
-        # Tokenize (the Gradio demo uses tokenizer(prompt) which adds no BOS by default)
-        input_ids = self.tokenizer(prompt, return_tensors="pt").input_ids
-
-        # Wrap with special tokens: START_OF_HUMAN ... END_OF_TURN END_OF_HUMAN
-        start_token = torch.tensor([[128259]], dtype=torch.int64)
-        end_tokens = torch.tensor([[128009, 128260]], dtype=torch.int64)
-        modified_input_ids = torch.cat([start_token, input_ids, end_tokens], dim=1)
-
-        attention_mask = torch.ones_like(modified_input_ids)
-
-        return modified_input_ids.to(self.device), attention_mask.to(self.device)
-
-    # -----------------------------------------------------------------------
-    # Full synthesis pipeline (matches Gradio demo generate_speech exactly)
-    # -----------------------------------------------------------------------
-    def _synthesize(
-        self,
-        text: str,
-        voice: str,
-        emotion: str | None,
-        temperature: float = 0.7,
-        top_p: float = 0.8,
-        repetition_penalty: float = 1.1,
-        max_tokens: int = 2048,
-    ) -> np.ndarray:
-        """prompt -> model.generate() -> parse_output() -> redistribute_codes() -> audio"""
-
-        # 1) Build prompt
-        input_ids, attention_mask = self._build_prompt(text, voice, emotion)
-        print(f"Prompt length: {input_ids.shape[1]} tokens")
-
-        # 2) Generate (matching Gradio demo parameters)
-        with torch.inference_mode():
-            generated_ids = self.model.generate(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                max_new_tokens=max_tokens,
-                do_sample=True,
-                temperature=temperature,
-                top_p=top_p,
-                repetition_penalty=repetition_penalty,
-                num_return_sequences=1,
-                eos_token_id=128258,  # END_OF_SPEECH
+        num_frames = len(multiframe) // TOTAL_CODEBOOKS
+        frame = multiframe[: num_frames * TOTAL_CODEBOOKS]
+        for j in range(num_frames):
+            i = TOTAL_CODEBOOKS * j
+            codes_0 = torch.cat([codes_0, torch.tensor([frame[i]], device=self.device, dtype=torch.int32)])
+            codes_1 = torch.cat(
+                [
+                    codes_1,
+                    torch.tensor([frame[i + 1]], device=self.device, dtype=torch.int32),
+                    torch.tensor([frame[i + 4]], device=self.device, dtype=torch.int32),
+                ]
+            )
+            codes_2 = torch.cat(
+                [
+                    codes_2,
+                    torch.tensor([frame[i + 2]], device=self.device, dtype=torch.int32),
+                    torch.tensor([frame[i + 3]], device=self.device, dtype=torch.int32),
+                    torch.tensor([frame[i + 5]], device=self.device, dtype=torch.int32),
+                    torch.tensor([frame[i + 6]], device=self.device, dtype=torch.int32),
+                ]
             )
 
-        total_tokens = generated_ids.shape[1]
-        new_tokens = total_tokens - input_ids.shape[1]
-        print(f"Generated {new_tokens} new tokens (total sequence: {total_tokens})")
+        codes = [codes_0.unsqueeze(0), codes_1.unsqueeze(0), codes_2.unsqueeze(0)]
+        if (
+            torch.any(codes[0] < 0)
+            or torch.any(codes[0] > 4096)
+            or torch.any(codes[1] < 0)
+            or torch.any(codes[1] > 4096)
+            or torch.any(codes[2] < 0)
+            or torch.any(codes[2] > 4096)
+        ):
+            return b""
 
-        # 3) Parse output: find START_OF_SPEECH, crop, remove END_OF_SPEECH, subtract 128266
-        code_list = parse_output(generated_ids)
-        print(f"Extracted {len(code_list)} SNAC codes ({len(code_list) // 7} frames)")
+        with torch.inference_mode():
+            audio_hat = self.snac_model.decode(codes)
 
-        if not code_list:
-            print("WARNING: No audio codes extracted, returning silence")
-            return np.zeros(SR, dtype=np.float32)
+        audio_slice = audio_hat[:, :, 2048:4096]
+        audio_np = audio_slice.detach().cpu().numpy()
+        audio_int16 = (audio_np * 32767).astype(np.int16)
+        return audio_int16.tobytes()
 
-        # Debug: print code range
-        print(f"Code range: min={min(code_list)}, max={max(code_list)}")
+    def _decode_full_buffer_to_pcm16(self, buffer):
+        if len(buffer) < TOTAL_CODEBOOKS:
+            return b""
 
-        # 4) Decode ALL codes at once via SNAC (NO sliding window, NO slicing)
-        audio = redistribute_codes(code_list, self.snac, self.device)
-        print(f"Audio: {audio.shape[0]} samples ({audio.shape[0] / SR:.2f}s), "
-              f"range=[{audio.min():.4f}, {audio.max():.4f}]")
+        num_frames = len(buffer) // TOTAL_CODEBOOKS
+        frame = buffer[: num_frames * TOTAL_CODEBOOKS]
 
-        return audio
+        codes_0 = []
+        codes_1 = []
+        codes_2 = []
 
-    # -----------------------------------------------------------------------
-    # Cog predict endpoint
-    # -----------------------------------------------------------------------
-    def predict(
-        self,
-        text: str = Input(
-            description="Text to synthesize into speech. Supports 19 Indian languages.",
-            default="नमस्ते, यह एक परीक्षण है।",
-        ),
-        voice: str = Input(
-            description=(
-                "Voice ID as {lang_code}_{gender}. "
-                "Codes: hi, en, bn, ta, te, mr, gu, kn, ml, pa, or, as, ur, sd, ne, si, sa, ks, doi. "
-                "Example: hi_female, en_male, ta_female."
-            ),
-            default="hi_female",
-        ),
-        emotion: str = Input(
-            description="Emotion/style tag to apply to the speech.",
-            default="none",
-            choices=["none", "neutral", "formal", "chat", "clear", "happy", "surprise", "sad", "fear", "anger", "disgust"],
-        ),
-        temperature: float = Input(
-            description="Sampling temperature. Higher = more expressive prosody.",
-            default=0.7,
-            ge=0.1,
-            le=1.5,
-        ),
-        top_p: float = Input(
-            description="Top-p (nucleus sampling). 0.6-0.8 for natural, 0.8-1.0 for expressive.",
-            default=0.8,
-            ge=0.1,
-            le=1.0,
-        ),
-        repetition_penalty: float = Input(
-            description="Repetition penalty. >= 1.1 recommended to prevent loops.",
-            default=1.1,
-            ge=0.9,
-            le=2.0,
-        ),
-        max_tokens: int = Input(
-            description="Maximum new tokens to generate. Typical: 900-1200 for most sentences.",
-            default=2048,
-            ge=100,
-            le=4096,
-        ),
-        seed: int = Input(
-            description="Random seed for reproducibility. -1 for random.",
-            default=-1,
-            ge=-1,
-        ),
-    ) -> Path:
-        """Synthesize speech from text and return a WAV file."""
-        if seed >= 0:
-            torch.manual_seed(seed)
-            np.random.seed(seed)
+        for j in range(num_frames):
+            i = TOTAL_CODEBOOKS * j
+            codes_0.append(frame[i])
+            codes_1.extend([frame[i + 1], frame[i + 4]])
+            codes_2.extend([frame[i + 2], frame[i + 3], frame[i + 5], frame[i + 6]])
 
-        start = time.time()
-        audio = self._synthesize(
-            text=text,
-            voice=voice,
-            emotion=emotion if emotion != "none" else None,
-            temperature=temperature,
-            top_p=top_p,
-            repetition_penalty=repetition_penalty,
-            max_tokens=max_tokens,
+        codes = [
+            torch.tensor([codes_0], device=self.device, dtype=torch.int32),
+            torch.tensor([codes_1], device=self.device, dtype=torch.int32),
+            torch.tensor([codes_2], device=self.device, dtype=torch.int32),
+        ]
+
+        if (
+            torch.any(codes[0] < 0)
+            or torch.any(codes[0] > 4096)
+            or torch.any(codes[1] < 0)
+            or torch.any(codes[1] > 4096)
+            or torch.any(codes[2] < 0)
+            or torch.any(codes[2] > 4096)
+        ):
+            return b""
+
+        with torch.inference_mode():
+            audio_hat = self.snac_model.decode(codes)
+
+        audio_np = audio_hat.detach().cpu().numpy().reshape(-1)
+        audio_int16 = (np.clip(audio_np, -1.0, 1.0) * 32767).astype(np.int16)
+        return audio_int16.tobytes()
+
+    def _pcm16_to_wav_bytes(self, pcm16_bytes: bytes):
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(SAMPLE_RATE)
+            wf.writeframes(pcm16_bytes)
+        return buf.getvalue()
+
+    async def _generate_stream_events(
+        self, request_id: str, prompt_string: str, sampling_params: SamplingParams
+    ) -> AsyncGenerator[str, None]:
+        stream = self.llm.generate(
+            prompt=prompt_string,
+            sampling_params=sampling_params,
+            request_id=request_id,
         )
-        elapsed = time.time() - start
-        print(f"Synthesis took {elapsed:.2f}s for {len(text)} chars")
 
-        # Normalize to prevent quiet audio
-        peak = np.abs(audio).max()
-        if peak > 0:
-            audio = audio / peak * 0.95
+        req_start = time.time()
+        buffer = []
+        count = 0
+        first_emit_at = None
+        chunk_index = 0
 
-        audio = np.clip(audio, -1.0, 1.0)
+        async for out in stream:
+            token = self._turn_token_into_id(out.outputs[0].text, count)
+            if token is None:
+                continue
+            if token > 0:
+                buffer.append(token)
+                count += 1
 
-        output_path = Path(tempfile.mktemp(suffix=".wav"))
-        sf.write(str(output_path), audio, SR)
-        return output_path
+            if count % TOTAL_CODEBOOKS == 0 and count > 27:
+                audio_samples = self._decode_recent_multiframe_to_pcm16(buffer[-28:])
+                if audio_samples:
+                    if first_emit_at is None:
+                        first_emit_at = time.time()
+                        print(
+                            f"[ttft] req_id={request_id} mode=stream "
+                            f"ttft_ms={(first_emit_at - req_start) * 1000.0:.2f}"
+                        )
+
+                    payload = {
+                        "event": "chunk",
+                        "chunk_index": chunk_index,
+                        "wav_chunk_b64": base64.b64encode(self._pcm16_to_wav_bytes(audio_samples)).decode("ascii"),
+                        "sampling_rate": SAMPLE_RATE,
+                    }
+                    chunk_index += 1
+                    yield json.dumps(payload) + "\n"
+
+        if first_emit_at is None:
+            print(f"[ttft] req_id={request_id} mode=stream ttft_ms=NA")
+
+        print(f"[timing] req_id={request_id} mode=stream total_ms={(time.time() - req_start) * 1000.0:.2f}")
+        final = {
+            "event": "done",
+            "num_audio_tokens": len(buffer),
+            "sampling_rate": SAMPLE_RATE,
+        }
+        yield json.dumps(final) + "\n"
+
+    async def _generate_non_stream_event(self, request_id: str, prompt_string: str, sampling_params: SamplingParams):
+        stream = self.llm.generate(
+            prompt=prompt_string,
